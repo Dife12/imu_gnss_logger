@@ -1,0 +1,833 @@
+/*
+[概要]
+本番環境用コード (デバッグ出力・OLED表示削除版)
+2025/11/19：送信データサイズを縮小
+GNSS (NEO-F10N) から緯度・経度・高度を取得 (20Hz)
+IMU (BMI270) から6軸（加速度・ジャイロ）を取得 (200Hz)
+RTC (PCF8563) から時刻を取得し、起動時にGNSS時刻で補正
+200Hzで取得した全データをSDカードにCSV形式で保存
+200Hzのうち10回に1回 (20Hz) のデータをCat-M1経由でSORACOM FunnelへUDP送信する
+*/
+
+/*RTC*/
+#include <PCF8563.h>
+PCF8563 pcf;
+
+/*gnss*/
+#include <SparkFun_u-blox_GNSS_v3.h>
+SFE_UBLOX_GNSS_SERIAL myGNSS;
+
+/*HardwareSerial*/
+#include <HardwareSerial.h>
+HardwareSerial gnssSerial(1);   // UART1 → GNSS
+HardwareSerial modemSerial(2);  // UART0 → Cat-M1
+
+/*IMU*/
+#include <Wire.h>
+#define SAMPLE_RATE 100  //IMUのサンプリングレート
+
+/*IMU_BMI270*/
+#include "SparkFun_BMI270_Arduino_Library.h"
+BMI270 imu270;
+
+/*SD*/
+#include <SPI.h>
+#include "SdFat.h"
+SdFat SD;
+#define SD_CS_PIN D2
+File dataFile;
+unsigned long sdLineCount = 0;
+unsigned long lastFlushMs = 0;
+String logFilename;
+
+uint8_t year;
+uint8_t month;
+uint8_t day;
+uint8_t hour;
+uint8_t minute;
+uint8_t second;
+uint16_t millisecond;
+
+// latitude・longitude・altitude
+double latitude;
+double longitude;
+long altitude;
+uint8_t siv;  // 衛星数
+
+// acceleration data
+float x, y, z;
+float gx, gy, gz;
+unsigned long send_count = 0;
+unsigned long data_number = 0;  //データのシーケンシャルナンバー
+String filename;                //SDカードに書き込みをする際のファイル名
+
+//JSON
+#include <ArduinoJson.h>
+#include <time.h>
+// ※JSON関連変数はコード内で直接使用されていないようですが、将来用として残しています
+StaticJsonDocument<6144> doc;
+JsonArray data;
+JsonObject dataObject;
+JsonArray ac;
+
+bool logged = false;
+
+// AWS送信用バイナリデータ定義
+#pragma pack(push, 1)
+struct SensorData {
+  uint32_t data_number;     // 4 bytes
+  uint64_t timestamp_ms;    // 8 bytes
+  double   lat;             // 8 bytes
+  double   lon;             // 8 bytes
+  int32_t  alt;             // 4 bytes
+  float    accx, accy, accz; // 12 bytes
+  float    gyrox, gyroy, gyroz; // 12 bytes
+  uint8_t  status;          // 1 byte
+  uint8_t  siv;             // 1 byte (衛星数)
+  char     reserved[2];     // 2 bytes (合計 60 バイトに調整)
+};
+#pragma pack(pop)
+
+const size_t BINARY_ITEM_SIZE = sizeof(SensorData); // 60 バイト
+#define BATCH_SIZE 24
+const size_t BATCH_PAYLOAD_SIZE = BINARY_ITEM_SIZE * BATCH_SIZE;
+
+/*queue*/
+#define MAX_QUE1_NUM 10000      //queue1のサイズ
+#define MAX_QUE1_SIZE sizeof(SensorData)  //queue1の大きさ(byte)
+#define MAX_QUE2_NUM 300    //queue2のキューのサイズ
+#define MAX_QUE2_SIZE 150   //queue2の各キューの大きさ(byte)
+
+QueueHandle_t queue1;
+QueueHandle_t queue2;
+
+static StaticQueue_t queue1_struct;
+uint8_t* queue1_buffer = NULL;
+// static portMUX_TYPE myMutex = portMUX_INITIALIZER_UNLOCKED; // 未使用のためコメントアウトまたは削除可
+unsigned long total_batch_attempts = 0;
+
+// プロトタイプ宣言
+bool serial_send(const uint8_t* data, size_t length);
+bool recoverSocket();     
+bool recoverNetwork();    
+bool recoverModemFull();  
+bool sendATCommand(const char *command, int delay_time = 500);
+void createFilename(uint16_t year, uint8_t month, uint8_t day, uint8_t hourUTC, uint8_t minute, uint8_t second);
+void writeDataToSD();
+
+void getImuTask(void *pvParameters) {                    //IMUの値を取得するタスク
+  const TickType_t xFrequency = 5 / portTICK_PERIOD_MS;  // 5ms (200Hz) 周期
+  TickType_t xLastWakeTime = xTaskGetTickCount();        // 最後に実行された時間を取得
+  while (1) {
+    //imu270
+    imu270.getSensorData();
+    x = imu270.data.accelX;
+    y = imu270.data.accelY;
+    z = imu270.data.accelZ;
+    gx = imu270.data.gyroX;
+    gy = imu270.data.gyroY;
+    gz = imu270.data.gyroZ;
+
+    Time nowTime = pcf.getTime();  //RTCモジュールから現在の時刻を取得
+    year = nowTime.year;
+    month = nowTime.month;
+    day = nowTime.day;
+    hour = nowTime.hour;
+    minute = nowTime.minute;
+    second = nowTime.second;
+    millisecond = millis() % 1000;
+
+    // --- SDカード (queue2) への保存 (毎回実行 @ 200Hz) ---
+    char buffer[MAX_QUE2_SIZE];
+    sprintf(buffer, "%d,20%u-%u-%u-%u-%u-%u-%u,%f,%f,%d,%u,%f,%f,%f,%f,%f,%f",
+            data_number, year, month, day, hour, minute, second, millisecond,
+            latitude, longitude, altitude, siv,
+            x, y, z, gx, gy, gz);
+
+    xQueueSend(queue2, buffer, (TickType_t)0);
+    if (uxQueueMessagesWaiting(queue2) >= SAMPLE_RATE) {
+      logged = true;
+    }
+
+    // --- クラウド (queue1) への送信 (10回に1回実行 @ 20Hz) ---
+    if (data_number % 5 == 0) {
+
+      double current_lat = latitude;
+      double current_lon = longitude;
+      long current_alt = altitude;
+
+      struct tm t;
+      t.tm_year = year + 100; // 1900年基準
+      t.tm_mon  = month - 1;  // 0-11
+      t.tm_mday = day;
+      t.tm_hour = hour;
+      t.tm_min  = minute;
+      t.tm_sec  = second;
+      time_t epoch_seconds = mktime(&t); 
+      uint64_t timestamp_ms = ((uint64_t)epoch_seconds * 1000) + millisecond;
+
+      SensorData data_packet;
+      data_packet.data_number = (uint32_t)data_number;
+      data_packet.timestamp_ms = timestamp_ms; 
+      data_packet.lat = current_lat;
+      data_packet.lon = current_lon;
+      data_packet.alt = (int32_t)current_alt;
+      data_packet.accx = x;
+      data_packet.accy = y;
+      data_packet.accz = z;
+      data_packet.gyrox = gx;
+      data_packet.gyroy = gy;
+      data_packet.gyroz = gz;
+      data_packet.status = 0x01;
+      data_packet.siv = siv;  // 衛星数を追加 
+      
+      xQueueSend(queue1, &data_packet, (TickType_t)0);
+    }
+
+    data_number++;
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);  // 5ms (200Hz) 周期を維持
+  }
+}
+
+void getGnssAndWriteLogTask(void *pvParameters) {        //GNSSの値を取得タスク
+  const TickType_t xFrequency = 50 / portTICK_PERIOD_MS;  // 50ms周期
+  TickType_t xLastWakeTime = xTaskGetTickCount();        
+  while (1) {
+
+    if (myGNSS.getPVT()) {
+      latitude = myGNSS.getLatitude() / 10000000.0;
+      longitude = myGNSS.getLongitude() / 10000000.0;
+      altitude = myGNSS.getAltitude();
+      siv = myGNSS.getSIV();  // 衛星数を取得
+    }
+
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+  }
+}
+
+void sendDataTask(void *pvParameters) 
+{
+  static uint8_t batch_buffer[BATCH_PAYLOAD_SIZE];
+  SensorData item_buf;
+  int items_collected = 0;
+  int consecutive_failures = 0;
+
+  while (1) {
+    if (xQueueReceive(queue1, &item_buf, portMAX_DELAY)) {
+      memcpy(&batch_buffer[items_collected * BINARY_ITEM_SIZE], &item_buf, BINARY_ITEM_SIZE);
+      items_collected++;
+
+      if (items_collected >= BATCH_SIZE) {
+        
+        bool send_complete = false;
+
+        while (!send_complete) {
+          
+          total_batch_attempts++;
+          
+          if (serial_send(batch_buffer, BATCH_PAYLOAD_SIZE)) {
+            Serial.println("Send Success!");
+            consecutive_failures = 0;
+            send_complete = true;
+            items_collected = 0;
+          } 
+          else {
+            consecutive_failures++;
+            Serial.printf("Send Failed. Fail count: %d.\n", consecutive_failures);
+
+            if (consecutive_failures == 3) {
+               Serial.println("Recovery L1: Reset Socket...");
+               recoverSocket();
+            }
+            else if (consecutive_failures == 5) {
+               Serial.println("Recovery L2: Reconnect Network...");
+               recoverNetwork();
+
+               Serial.println("Max retries (5) reached. Re-queuing data...");
+               
+               SensorData *requeue_ptr = (SensorData*)batch_buffer;
+
+               for(int i = 0; i < BATCH_SIZE; i++) {
+                   if (xQueueSend(queue1, &requeue_ptr[i], pdMS_TO_TICKS(10)) != pdTRUE) {
+                       Serial.println("Queue full. Failed to re-queue a packet.");
+                   }
+               }
+              
+               send_complete = true;     
+               items_collected = 0;      
+               consecutive_failures = 0; 
+            } 
+            else {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
+          }
+        }
+      }
+    }
+  }
+  vTaskDelete(NULL);
+}
+
+bool sendATCommand(const char *command, int delay_time) {
+  modemSerial.write(command); // modemSerial を使用
+
+  String response = "";
+  unsigned long startTime = millis();
+  
+  // ★ 10秒間のタイムアウトを設定
+  while (millis() - startTime < 10000) {
+    
+    // ★ データが受信できるまで待機する
+    if (modemSerial.available()) { // modemSerial を使用
+      char c = modemSerial.read(); // modemSerial を使用
+      response += c;
+
+      // ★ 応答を検知したらログを出してループを抜ける
+      if (response.indexOf("ERROR") != -1) {
+        Serial.print("AT Error: ");
+        Serial.println(response); // 応答内容を表示
+        return false;  // 失敗
+      }
+      if (response.indexOf("OK") != -1) {
+        Serial.print("AT OK: ");
+        Serial.println(response); // 応答内容を表示
+        return true;   // 成功
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(1)); // CPUを他のタスクに少し明け渡す
+  }
+
+  Serial.println("AT Command TIMEOUT!"); // 10秒待っても応答がなかった
+  Serial.println(response); // タイムアウトまでの受信内容
+  return false;
+}
+
+bool serial_send(const uint8_t* data, size_t length) {
+  vTaskDelay(pdMS_TO_TICKS(100));
+  
+  unsigned long flushStart = millis();
+  while (modemSerial.available() || (millis() - flushStart < 50)) {
+    if (modemSerial.available()) {
+      modemSerial.read(); // 読み捨て
+      flushStart = millis(); 
+    } else {
+      vTaskDelay(pdMS_TO_TICKS(1)); 
+    }
+  }
+  
+  char command[100];
+  sprintf(command, "AT+CASEND=0,%d\r\n", length);
+  modemSerial.write(command);
+
+  String response = "";
+  unsigned long startTime = millis();
+  bool promptReceived = false;
+  
+  // プロンプト待ち
+  while (millis() - startTime < 3000) {
+    if (modemSerial.available()) {
+      char c = modemSerial.read();
+      response += c;
+      if (response.endsWith("> ") || response.endsWith(">")) { 
+        promptReceived = true;
+        break;
+      }
+      if (response.indexOf("ERROR") != -1) {
+        Serial.print("Error before prompt: "); Serial.println(response);
+        return false; 
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+
+  if (!promptReceived) {
+    return false;
+  }
+
+  modemSerial.write(data, length);
+
+  response = "";
+  startTime = millis();
+  bool sendOk = false;
+  
+  // 送信完了確認
+  while (millis() - startTime < 10000) {
+    if (modemSerial.available()) {
+      char c = modemSerial.read();
+      response += c;
+      if (response.indexOf("OK") != -1) {
+        sendOk = true;
+        Serial.print("Data send OK: ");
+        Serial.print(uxQueueMessagesWaiting(queue1));
+        Serial.print("/");
+        Serial.println(MAX_QUE1_NUM);
+        break;
+      }
+      if (response.indexOf("ERROR") != -1) {
+        Serial.println("Data send ERROR: ");
+        break;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+
+  if (!sendOk && response.indexOf("ERROR") == -1) {
+      Serial.println("Data send TIMEOUT!");
+      return false; 
+  }
+
+  return sendOk;
+}
+
+bool recoverConnection() {
+  // --- ステップ1: 完全リセット (AT+CFUN=1,1) ---
+  modemSerial.write("AT+CFUN=1,1\r\n");
+  
+  // ★重要: 完全再起動には時間がかかります。20秒待ちます。
+  vTaskDelay(pdMS_TO_TICKS(20000)); 
+
+  // --- ステップ2: ネットワーク再接続 ---
+  bool active = false;
+  for(int i=0; i<5; i++){
+      if(sendATCommand("AT\r\n", 500)) {
+          active = true;
+          break;
+      }
+      vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+  
+  if(!active) {
+      return false;
+  }
+
+  sendATCommand("AT+CSQ\r\n");
+
+  // アタッチ (失敗してもスルー)
+  sendATCommand("AT+CGATT=1\r\n");
+  
+  // APN設定
+  sendATCommand("AT+CNCFG=0,1,\"soracom.io\"\r\n");
+
+  if (!sendATCommand("AT+CNACT=0,1\r\n")) {
+      return false;
+  }
+  
+  vTaskDelay(pdMS_TO_TICKS(3000));
+
+  // --- ステップ3: ソケット再接続 ---
+  sendATCommand("AT+CACLOSE=0\r\n"); 
+  vTaskDelay(pdMS_TO_TICKS(1000));
+
+  if (!sendATCommand("AT+CAOPEN=0,0,\"UDP\",\"funnel.soracom.io\",23080,1\r\n")) {
+    return false;
+  }
+  
+  return true;
+}
+
+bool recoverSocket() {
+  sendATCommand("AT+CACLOSE=0\r\n", 500);
+  if (!sendATCommand("AT+CAOPEN=0,0,\"UDP\",\"funnel.soracom.io\",23080,1\r\n")) {
+    return false;
+  }
+  return true;
+}
+
+bool recoverNetwork() {
+  sendATCommand("AT+CACLOSE=0\r\n", 500); 
+  sendATCommand("AT+CNACT=0,0\r\n", 2000);
+  
+  if (!sendATCommand("AT+CNACT=0,1\r\n", 5000)) {
+    return false;
+  }
+
+  return sendATCommand("AT+CAOPEN=0,0,\"UDP\",\"funnel.soracom.io\",23080,1\r\n");
+}
+
+bool recoverModemFull() {
+  modemSerial.write("AT+CFUN=1,1\r\n");
+  vTaskDelay(pdMS_TO_TICKS(20000));
+
+  bool active = false;
+  for(int i=0; i<10; i++){ 
+      if(sendATCommand("AT\r\n", 500)) {
+          active = true;
+          break;
+      }
+  }
+  if(!active) return false;
+
+  sendATCommand("AT+CFUN=1\r\n");
+  
+  sendATCommand("AT+CGATT=1\r\n");
+  sendATCommand("AT+CNCFG=0,1,\"soracom.io\"\r\n");
+  
+  if (!sendATCommand("AT+CNACT=0,1\r\n")) return false;
+  return sendATCommand("AT+CAOPEN=0,0,\"UDP\",\"funnel.soracom.io\",23080,1\r\n");
+}
+
+void writeSDTask(void *pvParameters) {
+  while (1) {
+    if (logged) {
+      writeDataToSD();
+      logged = false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+  vTaskDelete(NULL);
+}
+
+
+void setup() {
+  Serial.begin(115200);
+  setenv("TZ", "JST-9", 1);
+  tzset();
+  
+  delay(10);
+  
+  if (!SD.begin(SD_CS_PIN)) {
+    Serial.println("fail to initialize sd card");
+    return;
+  }
+  // ログファイル名を初期化（まだ時刻が取得できていないので仮の名前）
+  logFilename = "boot_log.txt";
+  writeLog("Power was supplied");
+  
+  gnssSerial.begin(38400, SERIAL_8N1, D0, D1);
+  
+  while (myGNSS.begin(gnssSerial) == false)
+  {
+    // GNSS接続待ち
+    delay(1000);
+  }
+
+  myGNSS.setUART1Output(COM_TYPE_UBX);                
+  myGNSS.saveConfigSelective(VAL_CFG_SUBSEC_IOPORT);  
+
+  myGNSS.setMeasurementRate(50);
+  myGNSS.setVal8(UBLOX_CFG_SIGNAL_GPS_L5_ENA, 1); 
+  myGNSS.setGPSL5HealthOverride(true);  
+  myGNSS.setLNAMode(SFE_UBLOX_LNA_MODE_NORMAL); 
+  myGNSS.softwareResetGNSSOnly(); 
+
+  modemSerial.begin(115200, SERIAL_8N1, D7, D6);  // Cat-M1 on UART0
+
+  Wire.begin();
+
+  // BMI270初期化
+  int result_imu270 = imu270.beginI2C(BMI2_I2C_PRIM_ADDR, Wire);
+  if (result_imu270 == BMI2_OK) {
+    imu270.setAccelODR(BMI2_ACC_ODR_200HZ);
+    imu270.setGyroODR(BMI2_GYR_ODR_200HZ);
+    Serial.println("BMI270 connected!");
+    writeLog("BMI270 connected successfully");
+  } else {
+    // IMU初期化失敗
+  }
+
+  /*
+  信頼できるデータを得るには4つ以上の衛星が必要ということにする
+  */
+  // while (myGNSS.getSIV() < 4) {
+  //   Serial.println("getting DateTime...");
+  //   Serial.printf("Number of Satellites is %u\n", myGNSS.getSIV());
+  //   char satMsg[100];
+  //   snprintf(satMsg, sizeof(satMsg), "Getting satellites... Current SIV: %u", myGNSS.getSIV());
+  //   writeLog(satMsg);
+  //   delay(500);
+  // }
+  uint16_t year = myGNSS.getYear();
+  uint8_t month = myGNSS.getMonth();
+  uint8_t day = myGNSS.getDay();
+  uint8_t hour = myGNSS.getHour();
+  uint8_t minute = myGNSS.getMinute();
+  uint8_t second = myGNSS.getSecond();
+
+  createFilename(year, month, day, hour, minute, second);
+
+  // ログファイル名を正式な時刻に基づいて更新
+  uint8_t hourJST = hour + 9;
+  if (hourJST >= 24) {
+    hourJST -= 24;
+  }
+  char logName[50];
+  snprintf(logName, sizeof(logName), "%04u-%02u-%02u-%02u-%02u-%02u_log.txt", 
+           year, month, day, hourJST, minute, second);
+  String newLogFilename = String(logName);
+  
+  // boot_log.txtが存在する場合、その内容を新しいログファイルに移行
+  File oldLogFile = SD.open("boot_log.txt", O_RDONLY);
+  if (oldLogFile) {
+    File newLogFile = SD.open(newLogFilename, O_RDWR | O_CREAT | O_AT_END);
+    if (newLogFile) {
+      // boot_log.txtの内容を新しいファイルにコピー
+      char buffer[256];
+      while (oldLogFile.available()) {
+        int bytesRead = oldLogFile.readBytesUntil('\n', buffer, sizeof(buffer) - 1);
+        if (bytesRead > 0) {
+          buffer[bytesRead] = '\0'; // null終端
+          newLogFile.print(buffer);
+          newLogFile.print('\n');
+        }
+      }
+      newLogFile.flush();
+      newLogFile.close();
+    }
+    oldLogFile.close();
+    
+    // boot_log.txtを削除
+    SD.remove("boot_log.txt");
+  }
+  
+  // ログファイル名を更新
+  logFilename = newLogFilename;
+  
+  // 正常に起動し始めたログ
+  writeLog("System started successfully - All initialization completed");
+
+  delay(100);
+
+  // ATコマンド初期設定
+  if (!sendATCommand("AT+CNACT=0,0\r\n")) {
+    Serial.println("Error: AT+CNACT");
+  }
+
+  if (!sendATCommand("AT+CGDCONT=1,\"IP\",\"soracom.io\"\r\n")) {
+    Serial.println("Error: AT+CGDCONT=1,\"IP\",\"soracom.io\"");
+  }
+
+  if (!sendATCommand("AT+CGDCONT?\r\n")) {
+    Serial.println("Error: AT+CGDCONT?");
+  }
+
+  if (!sendATCommand("AT+CFUN=1\r\n")) {
+    Serial.println("Error: AT+CFUN=1");
+  }
+
+  if (!sendATCommand("AT+CGATT=1\r\n")) {
+    Serial.println("Error: AT+CGATT=1");
+  }
+
+  if (!sendATCommand("AT+CGATT?\r\n")) {
+    Serial.println("Error: AT+CGATT?");
+  }
+
+  if (!sendATCommand("AT+CGACT=1,1\r\n")) {
+    Serial.println("Error: AT+CGACT=?");
+  }
+
+  if (!sendATCommand("AT+CGACT=?\r\n")) {
+    Serial.println("Error: AT+CGACT=?");
+  }
+
+  if (!sendATCommand("AT+CPIN?\r\n")) {
+    Serial.println("Error: AT+CPIN");
+  }
+
+  if (!sendATCommand("AT+CSQ\r\n")) {
+    Serial.println("Error: AT+CSQ");
+  }
+
+  if (!sendATCommand("AT+CASTATE?\r\n")) {
+    Serial.println("Error: AT+CASTATE?");
+  }
+
+  if (!sendATCommand("AT+COPS?\r\n")) {
+    Serial.println("Error: AT+COPS?");
+  }
+
+  if (!sendATCommand("AT+CGNAPN\r\n")) {
+    Serial.println("Error: AT+CGNAPN");
+  }
+
+  if (!sendATCommand("AT+CNCFG=0,1,\"soracom.io\" \r\n")) {
+    Serial.println("Error: AT+CNCFG=0,1,\"soracom.io\" ");
+  }
+
+  if (!sendATCommand("AT+CNCFG?\r\n")) {
+    Serial.println("Error: AT+CNCFG?");
+  }
+
+  if (!sendATCommand("AT+CNACT=0,1\r\n")) {
+    Serial.println("Error: AT+CNACT");
+  }
+
+  if (!sendATCommand("AT+CNACT?\r\n")) {
+    Serial.println("Error: AT+CNACT?");
+  }
+
+  if (!sendATCommand("AT+CACID=0\r\n")) {
+    Serial.println("Error: AT+CACID=0");
+  }
+
+  if (!sendATCommand("AT+CACID?\r\n")) {
+    Serial.println("Error: AT+CACID?");
+  }
+
+  if (!sendATCommand("AT+CASSLCFG=0,\"SSL\",0\r\n")) {
+    Serial.println("Error: AT+CASSLCFG?");
+  }
+
+  if (!sendATCommand("AT+CAOPEN=0,0,\"UDP\",\"funnel.soracom.io\",23080,1\r\n")) {
+    Serial.println("Error: AT+CAOPEN");
+  }
+
+  // PSRAM確保
+  queue1_buffer = (uint8_t*)ps_malloc(MAX_QUE1_NUM * MAX_QUE1_SIZE);
+
+  if (queue1_buffer == NULL) {
+    // メモリ確保失敗 - 致命的エラー
+    while(1) { vTaskDelay(1000); } 
+  }
+
+  // 静的キューを作成
+  queue1 = xQueueCreateStatic(MAX_QUE1_NUM, MAX_QUE1_SIZE, queue1_buffer, &queue1_struct);
+  
+  if (queue1 == NULL) {
+    // キュー作成失敗
+    while(1) { vTaskDelay(1000); } 
+  }
+
+  // queue2 (SRAM)
+  queue2 = xQueueCreate(MAX_QUE2_NUM, MAX_QUE2_SIZE);
+  
+  if (queue2 == NULL) {
+    // キュー作成失敗
+    while(1) { vTaskDelay(1000); } 
+  }
+
+  xTaskCreateUniversal(  //IMUタスク
+    getImuTask,          
+    "getImuTask",        
+    8192,                
+    NULL,                
+    2,                   
+    NULL,                
+    1                    
+  );
+  xTaskCreateUniversal(  //GNSS & Logタスク
+    getGnssAndWriteLogTask,
+    "getGnssAndWriteLogTask",
+    8192,
+    NULL,
+    3,  
+    NULL,
+    1  
+  );
+  xTaskCreateUniversal(  //送信タスク
+    sendDataTask,
+    "sendDataTask",
+    8192,
+    NULL,
+    1,  
+    NULL,
+    0  
+  );
+  xTaskCreateUniversal(  //SD書込タスク
+    writeSDTask,
+    "writeSDTask",
+    8192,
+    NULL,
+    0,  
+    NULL,
+    0  
+  );
+}
+
+void writeDataToSD()  //SDカードに書き込みを行う関数
+{
+  // 未オープンならオープン
+  if (!dataFile) {
+    dataFile = SD.open(filename, O_RDWR | O_CREAT | O_AT_END);
+    if (!dataFile) {
+      return;
+    }
+    lastFlushMs = millis();
+  }
+
+  // データをまとめて書き込む
+  char buf[MAX_QUE2_SIZE];
+  int count = uxQueueMessagesWaiting(queue2);
+  for (int i = 0; i < count; i++) {
+    if (xQueueReceive(queue2, buf, pdMS_TO_TICKS(0))) {
+      dataFile.println(buf);
+      sdLineCount++;
+    }
+  }
+
+  // 一定件数または一定時間ごとにflush
+  if (sdLineCount % 200 == 0 || (millis() - lastFlushMs) > 200) {
+    dataFile.flush();
+    lastFlushMs = millis();
+  }
+}
+
+void writeLog(const char* message) {
+  if (logFilename.length() == 0) {
+    return; // ログファイル名が設定されていない場合はスキップ
+  }
+  
+  File log = SD.open(logFilename, O_RDWR | O_CREAT | O_AT_END);
+  if (!log) {
+    return;
+  }
+  
+  char logEntry[200];
+  unsigned long currentMs = millis();
+  uint8_t logYear, logMonth, logDay, logHour, logMinute, logSecond;
+  Time logTime = pcf.getTime();
+  logYear = logTime.year;
+  logMonth = logTime.month;
+  logDay = logTime.day;
+  logHour = logTime.hour;
+  logMinute = logTime.minute;
+  logSecond = logTime.second;
+  
+  snprintf(logEntry, sizeof(logEntry), "[%04u-%02u-%02u %02u:%02u:%02u.%03lu] %s\n",
+           logYear + 2000, logMonth, logDay, logHour, logMinute, logSecond, currentMs % 1000, message);
+  log.print(logEntry);
+  log.flush();
+  log.close();
+}
+
+void createFilename(uint16_t year, uint8_t month, uint8_t day, uint8_t hourUTC, uint8_t minute, uint8_t second) {
+  // 日本時間を計算
+  uint8_t hourJST = hourUTC + 9;  // UTC+9時間
+  if (hourJST >= 24) {
+    hourJST -= 24;  // 24時間を超える場合は日付を進める
+    day++;
+
+    // 月末かどうかを判定して進める（簡易的に処理）
+    uint8_t daysInMonth[] = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 };
+    if ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0) {
+      daysInMonth[1] = 29;  // 閏年の場合は2月を29日とする
+    }
+
+    if (day > daysInMonth[month - 1]) {
+      day = 1;
+      month++;
+      if (month > 12) {
+        month = 1;
+        year++;
+      }
+    }
+  }
+  char date[32];  // ファイル名バッファ
+  // ファイル名を生成
+  snprintf(date, sizeof(date), "%04u-%02u-%02u-%02u-%02u-%02u.csv", year, month, day, hourJST, minute, second);
+  filename = String(date);
+
+  pcf.init();
+  pcf.stopClock();
+  pcf.setYear(year % 100);
+  pcf.setMonth(month);
+  pcf.setDay(day);
+  pcf.setHour(hourJST);
+  pcf.setMinut(minute);
+  pcf.setSecond(second);
+  pcf.startClock();
+}
+
+void loop() {
+  vTaskDelay(pdMS_TO_TICKS(1));
+}
