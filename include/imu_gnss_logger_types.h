@@ -41,3 +41,17 @@ struct LoggerRecord {
   float gz = 0.0f;
   float imuDtMs = 0.0f;
 };
+
+struct SessionMetadata {
+  char logFilename[16] = {0};
+  char metadataFilename[20] = {0};
+  uint16_t imuSampleRateHz = 0;
+  uint32_t gnssMeasurementPeriodMs = 0;
+  uint32_t gnssBaudrate = 0;
+  uint8_t sdCsPin = 0;
+  uint8_t gnssRxPin = 0;
+  uint8_t gnssTxPin = 0;
+  bool rtcEnabled = false;
+  bool rtcDetected = false;
+  bool gnssOnlineAtBoot = false;
+};

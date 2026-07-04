@@ -2,10 +2,11 @@
 #include <HardwareSerial.h>
 #include <SPI.h>
 #include <stdarg.h>
+#include <string.h>
 #include <Wire.h>
 #include <time.h>
 
-#include <PCF8563.h>
+#include <pcf8563.h>
 #include <SparkFun_BMI270_Arduino_Library.h>
 #include <SparkFun_u-blox_GNSS_v3.h>
 #include <SdFat.h>
@@ -14,7 +15,7 @@
 #include "imu_gnss_logger_csv.h"
 #include "imu_gnss_logger_types.h"
 
-PCF8563 rtc;
+PCF8563_Class rtc;
 SFE_UBLOX_GNSS_SERIAL gnss;
 HardwareSerial gnssSerial(1);
 BMI270 imu;
@@ -30,11 +31,15 @@ bool rtcPresent = false;
 bool rtcTimeAvailable = false;
 bool rtcSyncedFromGnss = false;
 bool gnssOnline = false;
+bool sdHealthy = true;
 
 uint64_t rtcBaseEpochMs = 0;
 uint32_t rtcBaseMillis = 0;
 uint32_t droppedLogRecords = 0;
 uint32_t writtenLogLines = 0;
+uint32_t imuReadErrors = 0;
+uint32_t sdWriteErrors = 0;
+uint32_t skippedGnssFixes = 0;
 
 char activeLogFilename[16] = { 0 };
 
@@ -46,13 +51,18 @@ bool isDateTimeSane(uint16_t year, uint8_t month, uint8_t day, uint8_t hour, uin
 uint64_t buildEpochMsUtc(uint16_t year, uint8_t month, uint8_t day, uint8_t hour, uint8_t minute, uint8_t second, uint16_t millisecond);
 bool createNextLogFilename(char *filename, size_t length);
 bool initSdCardAndLogFile();
+bool createMetadataFilename(const char *logFilename, char *metadataFilename, size_t length);
+bool writeSessionMetadataFile();
 bool initImu();
 bool initGnssModule();
 bool initRtc();
 void refreshRtcBaseFromChip();
 void updateRtcBaseFromEpoch(uint64_t epochMs);
 void syncRtcFromGnss(uint64_t epochMs);
+bool isGnssFixUsable(uint8_t fixType, uint8_t satellites);
 bool readGnssPvtAndUpdateState();
+bool appendCsvLineToLog(const char *line);
+bool flushLogFile();
 void printStartupSummary();
 void imuTask(void *pvParameters);
 void gnssTask(void *pvParameters);
@@ -130,6 +140,23 @@ bool createNextLogFilename(char *filename, size_t length) {
   return false;
 }
 
+bool createMetadataFilename(const char *logFilename, char *metadataFilename, size_t length) {
+  const char *extension = strrchr(logFilename, '.');
+  if (extension == nullptr) {
+    return false;
+  }
+
+  size_t stemLength = static_cast<size_t>(extension - logFilename);
+  if (stemLength + 5 >= length) {
+    return false;
+  }
+
+  memcpy(metadataFilename, logFilename, stemLength);
+  metadataFilename[stemLength] = '\0';
+  strncat(metadataFilename, ".TXT", length - strlen(metadataFilename) - 1);
+  return true;
+}
+
 bool initSdCardAndLogFile() {
   debugPrintf("Initializing SD card on CS pin %u", AppConfig::kSdCsPin);
   if (!SD.begin(AppConfig::kSdCsPin)) {
@@ -148,9 +175,56 @@ bool initSdCardAndLogFile() {
   }
 
   logFile.println(csvHeader());
-  logFile.flush();
+  if (!logFile.sync()) {
+    debugPrintf("Initial sync failed for %s", activeLogFilename);
+    return false;
+  }
   debugPrintf("Logging to %s", activeLogFilename);
   return true;
+}
+
+bool writeSessionMetadataFile() {
+  SessionMetadata metadata = {};
+  strncpy(metadata.logFilename, activeLogFilename, sizeof(metadata.logFilename) - 1);
+  if (!createMetadataFilename(activeLogFilename, metadata.metadataFilename, sizeof(metadata.metadataFilename))) {
+    debugPrint("Failed to create metadata filename");
+    return false;
+  }
+
+  metadata.imuSampleRateHz = AppConfig::kImuSampleRateHz;
+  metadata.gnssMeasurementPeriodMs = AppConfig::kGnssMeasurementPeriodMs;
+  metadata.gnssBaudrate = AppConfig::kGnssBaudrate;
+  metadata.sdCsPin = AppConfig::kSdCsPin;
+  metadata.gnssRxPin = AppConfig::kGnssRxPin;
+  metadata.gnssTxPin = AppConfig::kGnssTxPin;
+  metadata.rtcEnabled = AppConfig::kEnableRtc;
+  metadata.rtcDetected = rtcPresent;
+  metadata.gnssOnlineAtBoot = gnssOnline;
+
+  File metadataFile = SD.open(metadata.metadataFilename, O_WRITE | O_CREAT | O_TRUNC);
+  if (!metadataFile) {
+    debugPrintf("Failed to open metadata file %s", metadata.metadataFilename);
+    return false;
+  }
+
+  metadataFile.println("imu-gnss-logger session metadata");
+  metadataFile.printf("log_filename=%s\r\n", metadata.logFilename);
+  metadataFile.printf("imu_sample_rate_hz=%u\r\n", metadata.imuSampleRateHz);
+  metadataFile.printf("gnss_measurement_period_ms=%lu\r\n", static_cast<unsigned long>(metadata.gnssMeasurementPeriodMs));
+  metadataFile.printf("gnss_baudrate=%lu\r\n", static_cast<unsigned long>(metadata.gnssBaudrate));
+  metadataFile.printf("sd_cs_pin=%u\r\n", metadata.sdCsPin);
+  metadataFile.printf("gnss_rx_pin=%u\r\n", metadata.gnssRxPin);
+  metadataFile.printf("gnss_tx_pin=%u\r\n", metadata.gnssTxPin);
+  metadataFile.printf("rtc_enabled=%s\r\n", metadata.rtcEnabled ? "true" : "false");
+  metadataFile.printf("rtc_detected=%s\r\n", metadata.rtcDetected ? "true" : "false");
+  metadataFile.printf("gnss_online_at_boot=%s\r\n", metadata.gnssOnlineAtBoot ? "true" : "false");
+  metadataFile.printf("min_gnss_fix_type=%u\r\n", AppConfig::kMinGnssFixType);
+  metadataFile.printf("min_gnss_satellites=%u\r\n", AppConfig::kMinGnssSatellites);
+  metadataFile.printf("csv_header=%s\r\n", csvHeader());
+
+  bool synced = metadataFile.sync();
+  metadataFile.close();
+  return synced;
 }
 
 bool initImu() {
@@ -197,7 +271,11 @@ bool initRtc() {
     return false;
   }
 
-  rtc.init();
+  if (!rtc.begin(Wire, AppConfig::kRtcI2cAddress)) {
+    debugPrint("RTC begin failed");
+    return false;
+  }
+
   rtcPresent = true;
   refreshRtcBaseFromChip();
   debugPrint("RTC detected");
@@ -209,9 +287,12 @@ void refreshRtcBaseFromChip() {
     return;
   }
 
-  Time rtcTime = rtc.getTime();
-  uint16_t year = static_cast<uint16_t>(2000 + rtcTime.year);
-  uint64_t epochMs = buildEpochMsUtc(year, rtcTime.month, rtcTime.day, rtcTime.hour, rtcTime.minute, rtcTime.second, 0);
+  if (!rtc.isVaild()) {
+    return;
+  }
+
+  RTC_Date rtcTime = rtc.getDateTime();
+  uint64_t epochMs = buildEpochMsUtc(rtcTime.year, rtcTime.month, rtcTime.day, rtcTime.hour, rtcTime.minute, rtcTime.second, 0);
   if (epochMs == 0) {
     return;
   }
@@ -240,18 +321,21 @@ void syncRtcFromGnss(uint64_t epochMs) {
   struct tm utcTime = {};
   gmtime_r(&epochSeconds, &utcTime);
 
-  rtc.stopClock();
-  rtc.setYear((utcTime.tm_year + 1900) % 100);
-  rtc.setMonth(utcTime.tm_mon + 1);
-  rtc.setDay(utcTime.tm_mday);
-  rtc.setHour(utcTime.tm_hour);
-  rtc.setMinut(utcTime.tm_min);
-  rtc.setSecond(utcTime.tm_sec);
-  rtc.startClock();
+  rtc.setDateTime(static_cast<uint16_t>(utcTime.tm_year + 1900),
+                  static_cast<uint8_t>(utcTime.tm_mon + 1),
+                  static_cast<uint8_t>(utcTime.tm_mday),
+                  static_cast<uint8_t>(utcTime.tm_hour),
+                  static_cast<uint8_t>(utcTime.tm_min),
+                  static_cast<uint8_t>(utcTime.tm_sec));
 
   updateRtcBaseFromEpoch(epochMs);
   rtcSyncedFromGnss = true;
   debugPrint("RTC synchronized from GNSS UTC");
+}
+
+bool isGnssFixUsable(uint8_t fixType, uint8_t satellites) {
+  return fixType >= AppConfig::kMinGnssFixType &&
+         satellites >= AppConfig::kMinGnssSatellites;
 }
 
 bool readGnssPvtAndUpdateState() {
@@ -265,16 +349,23 @@ bool readGnssPvtAndUpdateState() {
   uint8_t hour = gnss.getHour();
   uint8_t minute = gnss.getMinute();
   uint8_t second = gnss.getSecond();
+  uint16_t millisecond = gnss.getMillisecond();
 
   bool hasUtc = isDateTimeSane(year, month, day, hour, minute, second);
-  uint64_t epochMs = hasUtc ? buildEpochMsUtc(year, month, day, hour, minute, second, 0) : 0;
+  uint64_t epochMs = hasUtc ? buildEpochMsUtc(year, month, day, hour, minute, second, millisecond) : 0;
 
   if (hasUtc && rtcPresent && !rtcSyncedFromGnss) {
     syncRtcFromGnss(epochMs);
   }
 
   uint8_t fixQuality = gnss.getFixType();
-  if (fixQuality < 2) {
+  uint8_t satellites = gnss.getSIV();
+  if (!isGnssFixUsable(fixQuality, satellites)) {
+    portENTER_CRITICAL(&stateMux);
+    latestGnssFix.hasValidFix = false;
+    latestGnssFix.hasUtc = false;
+    portEXIT_CRITICAL(&stateMux);
+    skippedGnssFixes++;
     return true;
   }
 
@@ -290,10 +381,45 @@ bool readGnssPvtAndUpdateState() {
   latestGnssFix.speedMmPerSec = gnss.getGroundSpeed();
   latestGnssFix.headingDegE5 = gnss.getHeading();
   latestGnssFix.fixQuality = fixQuality;
-  latestGnssFix.satellites = gnss.getSIV();
+  latestGnssFix.satellites = satellites;
   portEXIT_CRITICAL(&stateMux);
 
   return true;
+}
+
+bool appendCsvLineToLog(const char *line) {
+  if (!logFile) {
+    sdWriteErrors++;
+    sdHealthy = false;
+    return false;
+  }
+
+  size_t bytesWritten = logFile.println(line);
+  if (bytesWritten == 0) {
+    sdWriteErrors++;
+    sdHealthy = false;
+    return false;
+  }
+
+  sdHealthy = true;
+  return true;
+}
+
+bool flushLogFile() {
+  if (!logFile) {
+    sdWriteErrors++;
+    sdHealthy = false;
+    return false;
+  }
+
+  bool synced = logFile.sync();
+  if (!synced) {
+    sdWriteErrors++;
+    sdHealthy = false;
+  } else {
+    sdHealthy = true;
+  }
+  return synced;
 }
 
 void printStartupSummary() {
@@ -312,9 +438,21 @@ void imuTask(void *pvParameters) {
   TickType_t lastWakeTime = xTaskGetTickCount();
   uint32_t imuSampleId = 0;
   uint32_t lastSampleUs = micros();
+  uint32_t lastImuErrorPrintMs = 0;
 
   while (true) {
-    imu.getSensorData();
+    int8_t imuResult = imu.getSensorData();
+    if (imuResult != BMI2_OK) {
+      imuReadErrors++;
+      uint32_t nowMs = millis();
+      if (AppConfig::kEnableDebugPrint &&
+          (lastImuErrorPrintMs == 0 || nowMs - lastImuErrorPrintMs >= AppConfig::kImuErrorPrintIntervalMs)) {
+        debugPrintf("IMU read failed: %d (total=%lu)", imuResult, static_cast<unsigned long>(imuReadErrors));
+        lastImuErrorPrintMs = nowMs;
+      }
+      vTaskDelayUntil(&lastWakeTime, periodTicks);
+      continue;
+    }
 
     uint32_t nowMs = millis();
     uint32_t nowUs = micros();
@@ -345,7 +483,10 @@ void imuTask(void *pvParameters) {
     record.gz = imu.data.gyroZ;
     record.imuDtMs = imuDtMs;
 
-    if (gnssSnapshot.hasValidFix) {
+    bool useGnssFix = gnssSnapshot.hasValidFix &&
+                      ((nowMs - gnssSnapshot.lastUpdateMs) <= AppConfig::kMaxGnssReuseAgeMs);
+
+    if (useGnssFix) {
       // Each IMU row is stamped with the latest valid GNSS fix and its age.
       record.hasGnss = true;
       record.gnssFixId = gnssSnapshot.fixId;
@@ -361,6 +502,9 @@ void imuTask(void *pvParameters) {
       if (gnssSnapshot.hasUtc && gnssSnapshot.utcEpochMs != 0) {
         record.hasUtc = true;
         record.utcEpochMs = gnssSnapshot.utcEpochMs + static_cast<uint64_t>(record.gnssAgeMs);
+      } else if (localRtcTimeAvailable) {
+        record.hasUtc = true;
+        record.utcEpochMs = localRtcBaseEpochMs + static_cast<uint64_t>(nowMs - localRtcBaseMillis);
       }
     } else if (localRtcTimeAvailable) {
       record.hasUtc = true;
@@ -406,6 +550,7 @@ void loggerTask(void *pvParameters) {
   char csvLine[AppConfig::kCsvLineBufferSize];
   uint32_t lastFlushMs = millis();
   uint32_t lastStatusMs = millis();
+  uint32_t lastSdErrorPrintMs = 0;
   uint32_t linesSinceFlush = 0;
   LoggerRecord record = {};
 
@@ -413,9 +558,10 @@ void loggerTask(void *pvParameters) {
     if (xQueueReceive(logQueue, &record, pdMS_TO_TICKS(20)) == pdTRUE) {
       if (formatCsvRecord(record, csvLine, sizeof(csvLine))) {
         // Flush in batches to keep SD latency away from the IMU sampling path.
-        logFile.println(csvLine);
-        writtenLogLines++;
-        linesSinceFlush++;
+        if (appendCsvLineToLog(csvLine)) {
+          writtenLogLines++;
+          linesSinceFlush++;
+        }
       }
     }
 
@@ -423,9 +569,17 @@ void loggerTask(void *pvParameters) {
     if (linesSinceFlush > 0 &&
         (nowMs - lastFlushMs >= AppConfig::kLogFlushIntervalMs ||
          linesSinceFlush >= AppConfig::kLogFlushLineInterval)) {
-      logFile.flush();
-      lastFlushMs = nowMs;
-      linesSinceFlush = 0;
+      if (flushLogFile()) {
+        lastFlushMs = nowMs;
+        linesSinceFlush = 0;
+      }
+    }
+
+    if (!sdHealthy &&
+        AppConfig::kEnableDebugPrint &&
+        (lastSdErrorPrintMs == 0 || nowMs - lastSdErrorPrintMs >= AppConfig::kSdErrorPrintIntervalMs)) {
+      debugPrintf("SD write/sync failure detected (errors=%lu)", static_cast<unsigned long>(sdWriteErrors));
+      lastSdErrorPrintMs = nowMs;
     }
 
     if (AppConfig::kEnableDebugPrint && nowMs - lastStatusMs >= AppConfig::kStatusPrintIntervalMs) {
@@ -439,6 +593,11 @@ void loggerTask(void *pvParameters) {
                   static_cast<unsigned long>(droppedLogRecords),
                   static_cast<unsigned long>(writtenLogLines),
                   static_cast<unsigned long>(latestFixId));
+      debugPrintf("imu_errors=%lu sd_errors=%lu skipped_gnss=%lu sd_ok=%s",
+                  static_cast<unsigned long>(imuReadErrors),
+                  static_cast<unsigned long>(sdWriteErrors),
+                  static_cast<unsigned long>(skippedGnssFixes),
+                  sdHealthy ? "true" : "false");
       lastStatusMs = nowMs;
     }
   }
@@ -476,6 +635,10 @@ void setup() {
       }
       delay(20);
     }
+  }
+
+  if (!writeSessionMetadataFile()) {
+    debugPrint("Failed to write session metadata file");
   }
 
   logQueue = xQueueCreate(AppConfig::kLoggerQueueLength, sizeof(LoggerRecord));

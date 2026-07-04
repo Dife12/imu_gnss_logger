@@ -22,10 +22,13 @@ constexpr uint32_t kGnssBaudrate = 38400;
 constexpr uint16_t kImuSampleRateHz = 200;
 constexpr uint32_t kGnssMeasurementPeriodMs = 50;
 constexpr uint32_t kGnssPollPeriodMs = 50;
+constexpr uint8_t kMinGnssFixType = 3;
+constexpr uint8_t kMinGnssSatellites = 4;
 
 constexpr uint32_t kGnssBootPrimeTimeoutMs = 1500;
 constexpr uint32_t kGnssInitRetryMs = 2000;
 constexpr uint32_t kRtcRefreshIntervalMs = 1000;
+constexpr uint32_t kMaxGnssReuseAgeMs = 1000;
 
 constexpr size_t kLoggerQueueLength = 256;
 constexpr uint32_t kLogFlushIntervalMs = 1000;
@@ -34,5 +37,7 @@ constexpr uint32_t kStatusPrintIntervalMs = 5000;
 
 constexpr uint8_t kRtcI2cAddress = 0x51;
 constexpr size_t kCsvLineBufferSize = 256;
+constexpr uint32_t kImuErrorPrintIntervalMs = 2000;
+constexpr uint32_t kSdErrorPrintIntervalMs = 2000;
 
 }  // namespace AppConfig

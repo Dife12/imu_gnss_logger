@@ -13,6 +13,7 @@
 - 可选使用 PCF8563 RTC 作为时间回退
 - 以 IMU 采样为主，给每条 IMU 数据附上最近一次 GNSS fix
 - 将数据持续写入 SD 卡
+- 启动时输出一份 session metadata 文本文件
 
 ### 硬件
 
@@ -43,6 +44,13 @@
 - `imuTask`：按 200Hz 采集 IMU
 - `gnssTask`：按 20Hz 刷新 GNSS 状态
 - `loggerTask`：从队列读取记录并写入 SD 卡
+
+当前可靠性处理：
+
+- IMU 读取失败时跳过该条样本，避免旧值混入新数据
+- GNSS 只有在 `fixType >= 3` 且卫星数不少于 4 时才会更新为有效 fix
+- SD 写入和同步失败会在串口显式报错
+- 启动时会额外生成一个与日志同名的 `LOG_XXXX.TXT` metadata 文件
 
 ### CSV 格式
 
@@ -92,10 +100,11 @@ pio device monitor -b 115200
 
 1. 初始化串口
 2. 初始化 SD 卡并创建新的 `LOG_XXXX.CSV`
-3. 初始化 IMU
-4. 初始化 GNSS
-5. 如果存在 RTC，则初始化 RTC
-6. 启动采集与写卡任务
+3. 创建同批次 `LOG_XXXX.TXT` metadata 文件
+4. 初始化 IMU
+5. 初始化 GNSS
+6. 如果存在 RTC，则初始化 RTC
+7. 启动采集与写卡任务
 
 ### 当前限制
 
