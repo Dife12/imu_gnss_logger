@@ -30,14 +30,14 @@
 - `GNSS_TX_PIN = D1`
 - I2C：默认使用开发板 `Wire.begin()` 默认引脚
 
-配置集中在 [include/imu_gnss_logger_config.h](/Users/tekihi/Documents/RoadSense Toolkit/imu_gnss_logger/include/imu_gnss_logger_config.h)。
+配置集中在 [include/imu_gnss_logger_config.h]。
 
 ### 程序结构
 
-- [src/main.cpp](/Users/tekihi/Documents/RoadSense Toolkit/imu_gnss_logger/src/main.cpp)：主程序与 FreeRTOS 任务
-- [src/imu_gnss_logger_csv.cpp](/Users/tekihi/Documents/RoadSense Toolkit/imu_gnss_logger/src/imu_gnss_logger_csv.cpp)：CSV 格式化
-- [include/imu_gnss_logger_types.h](/Users/tekihi/Documents/RoadSense Toolkit/imu_gnss_logger/include/imu_gnss_logger_types.h)：数据结构
-- [platformio.ini](/Users/tekihi/Documents/RoadSense Toolkit/imu_gnss_logger/platformio.ini)：PlatformIO 配置
+- [src/main.cpp]：主程序与 FreeRTOS 任务
+- [src/imu_gnss_logger_csv.cpp]：CSV 格式化
+- [include/imu_gnss_logger_types.h]：数据结构
+- [platformio.ini]：PlatformIO 配置
 
 当前任务划分：
 
@@ -69,7 +69,7 @@ timestamp_ms,datetime_utc,imu_sample_id,gnss_fix_id,lat,lon,alt_m,speed_mps,head
 - `gnss_age_ms`：当前 IMU 样本使用的 GNSS 数据距离最新更新时间的延迟
 - 缺失值统一写 `NA`
 
-示例见 [data/sample/sample_log.csv](/Users/tekihi/Documents/RoadSense Toolkit/imu_gnss_logger/data/sample/sample_log.csv)。
+示例见 [data/sample/sample_log.csv]。
 
 ### 编译与烧录
 
@@ -80,7 +80,7 @@ timestamp_ms,datetime_utc,imu_sample_id,gnss_fix_id,lat,lon,alt_m,speed_mps,head
 
 在 VS Code 中：
 
-1. 打开 [imu_gnss_logger](/Users/tekihi/Documents/RoadSense Toolkit/imu_gnss_logger)
+1. 打开 [imu_gnss_logger]
 2. 安装 PlatformIO IDE 扩展
 3. 运行 `Build`
 4. 连接开发板后运行 `Upload`
@@ -140,11 +140,11 @@ pio device monitor -b 115200
 - PlatformIO プロジェクト
 - 環境：`seeed_xiao_esp32s3`
 
-VS Code で [imu_gnss_logger](/Users/tekihi/Documents/RoadSense Toolkit/imu_gnss_logger) を開き、PlatformIO から `Build` / `Upload` / `Monitor` を実行してください。
+VS Code で [imu_gnss_logger]を開き、PlatformIO から `Build` / `Upload` / `Monitor` を実行してください。
 
 ### 出力
 
-各 IMU サンプルにつき 1 行の CSV を出力します。CSV サンプルは [data/sample/sample_log.csv](/Users/tekihi/Documents/RoadSense Toolkit/imu_gnss_logger/data/sample/sample_log.csv) を参照してください。
+各 IMU サンプルにつき 1 行の CSV を出力します。CSV サンプルは [data/sample/sample_log.csv]を参照してください。
 
 ## English
 
@@ -167,11 +167,11 @@ The current code focuses only on:
 - Environment: `seeed_xiao_esp32s3`
 - Framework: Arduino
 
-Open [imu_gnss_logger](/Users/tekihi/Documents/RoadSense Toolkit/imu_gnss_logger) in VS Code and use PlatformIO to `Build`, `Upload`, and `Monitor`.
+Open [imu_gnss_logger] in VS Code and use PlatformIO to `Build`, `Upload`, and `Monitor`.
 
 ### Output
 
-The logger writes `LOG_XXXX.CSV` files to the SD card. Each row contains one IMU sample plus the latest available GNSS fix. A sample file is available at [data/sample/sample_log.csv](/Users/tekihi/Documents/RoadSense Toolkit/imu_gnss_logger/data/sample/sample_log.csv).
+The logger writes `LOG_XXXX.CSV` files to the SD card. Each row contains one IMU sample plus the latest available GNSS fix. A sample file is available at [data/sample/sample_log.csv]).
 
 ### Notes
 
